@@ -1,0 +1,11 @@
+[package]
+name = "mocketd"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1.0.86"
+iron = "0.6.1"
+serde_json = "1.0.125"
+tokio = { version = "1", features = ["full"] }
+wasmtime = "23.0.2"
