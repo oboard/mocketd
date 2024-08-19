@@ -108,6 +108,7 @@ async fn handle_connection(stream: TcpStream, handler: RequestHandler) -> io::Re
     let mut parts = request_line.split_whitespace();
     let method = parts.next().unwrap_or("").to_string();
     let path = parts.next().unwrap_or("").to_string();
+    println!("{}", request_line.to_string());
 
     let request = Request { method, path };
     if let Err(e) = handler(request, stream).await {

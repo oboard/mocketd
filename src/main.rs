@@ -5,19 +5,39 @@ mod nodehttp;
 
 use anyhow::anyhow;
 use nodehttp::Response;
-use std::collections::HashMap;
 
 use serde_json::json;
 use serde_json::Value;
-use std::env;
+use std::collections::HashMap;
 use std::fs;
 use std::process;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use wasmtime::*;
 
+static LOG_LEVEL: AtomicUsize = AtomicUsize::new(0);
+
+fn set_log_level(level: usize) {
+    LOG_LEVEL.store(level, Ordering::Relaxed);
+}
+
+fn log(level: usize, message: &str) {
+    if level <= LOG_LEVEL.load(Ordering::Relaxed) {
+        println!("{}", message);
+    }
+}
+
 static mut WASM_STORE: Option<Store<()>> = None;
 static mut WASM_INSTANCE: Option<Instance> = None;
-static mut RESPONSE_STACK: Vec<Response> = Vec::new();
+
+#[macro_use]
+extern crate lazy_static;
+
+lazy_static! {
+    static ref RESPONSE_MAP: Arc<Mutex<HashMap<usize, Response>>> =
+        Arc::new(Mutex::new(HashMap::new()));
+    static ref NEXT_ID: AtomicUsize = AtomicUsize::new(0);
+}
 
 // Define the function to initialize WASM and return an instance and store
 fn init_wasm(wasm_path: &str) -> (Store<()>, Instance) {
@@ -154,7 +174,40 @@ fn send_event(event_type: &str, data: Value) {
 
 #[tokio::main]
 async fn main() {
-    let wasm_path = env::args().nth(1).expect("Usage: <wasm-file>");
+    let matches = clap::Command::new("Mocket Runtime")
+        .version("1.0")
+        .author("oboard <oboard@outlook.com>")
+        .about("a WebAssembly runtime for Mocket")
+        .arg(
+            clap::Arg::new("wasm_file")
+                .help("Path to the WebAssembly file")
+                .required(true)
+                .index(1),
+        )
+        .arg(
+            clap::Arg::new("log_level")
+                .short('l')
+                .long("log")
+                .help("Sets the log level (0: no logs, 1: minimal logs, 2: verbose logs)"),
+        )
+        .get_matches();
+
+    let wasm_path = matches.get_one::<String>("wasm_file").unwrap();
+    let log_level = (*matches
+        .get_one::<String>("log_level")
+        .unwrap_or(&"0".to_string()))
+    .parse::<usize>()
+    .unwrap_or(0);
+
+    // Set log level (this is just an example, adapt to your logging needs)
+    match log_level {
+        0 => println!("Log level: 0 (No logs)"),
+        1 => println!("Log level: 1 (Minimal logs)"),
+        2 => println!("Log level: 2 (Verbose logs)"),
+        _ => println!("Unknown log level: {}", log_level),
+    }
+
+    set_log_level(log_level);
 
     // Initialize WASM and get store and instance
     let (store, instance) = init_wasm(&wasm_path);
@@ -167,11 +220,11 @@ async fn main() {
     let mut store: Store<()> = unsafe { WASM_STORE.take().unwrap() };
     if let Ok(start) = instance.get_typed_func::<(), ()>(&mut store, "_start") {
         if let Err(err) = start.call(&mut store, ()) {
-            eprintln!("Failed to execute '_start': {}", err);
+            log(1, &format!("Failed to execute '_start': {}", err));
             process::exit(1);
         }
     } else {
-        println!("No '_start' function found in {}", wasm_path);
+        log(2, &format!("No '_start' function found in {}", wasm_path));
     }
 
     unsafe {
@@ -184,46 +237,63 @@ async fn main() {
     process::exit(0);
 }
 
+fn map_to_iter(
+    map: serde_json::Map<String, Value>,
+) -> impl IntoIterator<Item = (impl AsRef<str>, impl AsRef<str>)> {
+    map.into_iter().filter_map(|(key, value)| {
+        // Try to convert the value to a string reference
+        if let Value::String(s) = value {
+            Some((key, s)) // Return a tuple with (key, value) where both are &str
+        } else {
+            None // Ignore non-string values
+        }
+    })
+}
+
 // Function to handle the parsed JSON object
 async fn handle_receive(json_value: Value) -> std::io::Result<()> {
-    println!("Received JSON: {}", json_value);
+    log(1, &format!("Received JSON: {}", json_value));
 
     async fn listen(port: u16) -> std::io::Result<()> {
-        // 创建一个 HTTP 服务器
-        let server = nodehttp::create_server(|req, res| {
+        log(1, &format!("Listening on port {}", port));
+
+        let server = nodehttp::create_server(|req, mut res| {
+            log(2, &format!("Received request: {} {}", req.method, req.path));
+
             if [
                 "GET", "POST", "PUT", "DELETE", "HEAD", "OPTIONS", "CONNECT", "TRACE", "PATCH",
             ]
             .contains(&(req.method.as_str()))
             {
                 Box::pin(async move {
+                    let id = NEXT_ID.fetch_add(1, Ordering::SeqCst);
                     let data = json!([
                         {
                             "method": req.method,
                             "url": req.path,
                         },
                         {
-                            "id": unsafe{RESPONSE_STACK.len()},
+                            "id": id,
                         }
                     ]);
-                    println!("{}", data);
-                    // 设置响应头
+                    log(1, &format!("{}", data));
                     send_event("http.request", data);
-                    unsafe {
-                        RESPONSE_STACK.push(res);
-                    }
 
-                    // // Task to receive the value
-                    // res.write_head(200, HashMap::from([("Content-Type", "text/plain")]))
-                    //     .await?;
+                    // 存储 ID 和响应的映射
+                    let mut response_map = RESPONSE_MAP.lock().unwrap();
+                    response_map.insert(id, res);
 
-                    // // 向客户端发送响应内容
-                    // res.end("Hello, World!\n").await?;
                     Ok(())
                 })
             } else {
                 Box::pin(async move {
-                    eprintln!("Invalid method `{}`", req.method);
+                    log(2, &format!("Invalid method `{}`", req.method));
+                    // res.write_head(
+                    //     200,
+                    //     std::collections::HashMap::from([("Content-Type", "text/plain")]),
+                    // )
+                    // .await?;
+                    res.end("").await?;
                     Ok(())
                 })
             }
@@ -247,55 +317,76 @@ async fn handle_receive(json_value: Value) -> std::io::Result<()> {
                     }
                 }
             }
-            "http.writeHead" => {
-                if let Value::Array(vec) = handle_data {
-                    match vec.as_slice() {
-                        [Value::Number(id), Value::Number(status_code), Value::Object(headers)] => {
-                            let response = unsafe {
-                                RESPONSE_STACK.get_mut(id.as_i64().unwrap_or(0i64) as usize)
-                            };
-                            let status_code = status_code.as_i64().unwrap_or(500i64) as u16;
-                            let headers = headers;
-                            match response {
-                                Some(response) => {
-                                    response
-                                        .write_head(
-                                            status_code,
-                                            HashMap::from([("Content-Type", "text/plain")]),
-                                        )
-                                        .await?;
-                                }
-                                None => {
-                                    eprintln!("Invalid response id");
-                                    return Ok(());
-                                }
-                            }
+            // "http.writeHead" => {
+            //     if let Value::Array(vec) = handle_data {
+            //         match vec.as_slice() {
+            //             [Value::Number(id), Value::Number(status_code), Value::Object(headers)] => {
+            //                 let index = id.as_f64().unwrap_or(0f64) as usize;
+            //                 let response = unsafe { RESPONSE_STACK.get_mut(index) };
+            //                 let status_code = status_code.as_f64().unwrap_or(500f64) as u16;
+            //                 // let headers = headers;
+            //                 match response {
+            //                     Some(response) => {
+            //                         response
+            //                             .write_head(
+            //                                 status_code,
+            //                                 HashMap::from([("Content-Type", "text/plain")]),
+            //                             )
+            //                             .await?;
+            //                     }
+            //                     None => {
+            //                         eprintln!("Invalid response id");
+            //                         return Ok(());
+            //                     }
+            //                 }
 
-                            Ok(())
-                        }
-                        _ => {
-                            eprintln!("Invalid http.writeHead data");
-                            Ok(())
-                        }
-                    }
-                } else {
-                    println!("Expected an array.");
-                    Ok(())
-                }
-            }
+            //                 Ok(())
+            //             }
+            //             _ => {
+            //                 eprintln!("Invalid http.writeHead data");
+            //                 Ok(())
+            //             }
+            //         }
+            //     } else {
+            //         println!("Expected an array.");
+            //         Ok(())
+            //     }
+            // }
             "http.end" => {
                 if let Value::Array(vec) = handle_data {
                     match vec.as_slice() {
-                        [Value::Number(id), Value::String(body)] => {
-                            let response = unsafe {
-                                RESPONSE_STACK.get_mut(id.as_i64().unwrap_or(0i64) as usize)
-                            };
+                        [Value::Number(id), Value::Number(status_code), Value::Object(headers), body] =>
+                        {
+                            let index = id.as_f64().unwrap_or(0f64) as usize;
+                            let headers = headers;
+                            log(3, format!("index: {}", index).as_str());
+                            let mut response_map = RESPONSE_MAP.lock().unwrap();
+                            let response = response_map.remove(&index);
                             match response {
-                                Some(response) => {
-                                    response.end(body).await?;
+                                Some(mut response) => {
+                                    response
+                                        .write_head(
+                                            status_code.as_f64().unwrap_or(500f64) as u16,
+                                            map_to_iter(headers.clone()),
+                                        )
+                                        .await?;
+
+                                    // 如果是string则直接发送，如果是json object则strinify
+                                    match body {
+                                        Value::String(s) => {
+                                            response.end(s).await?;
+                                        }
+                                        Value::Object(o) => {
+                                            let json_string = serde_json::to_string(o).unwrap();
+                                            response.end(&json_string).await?;
+                                        }
+                                        _ => {
+                                            eprintln!("Invalid body type");
+                                        }
+                                    }
                                     Ok(())
                                 }
-                                None => {
+                                _ => {
                                     eprintln!("Invalid response id");
                                     Ok(())
                                 }
