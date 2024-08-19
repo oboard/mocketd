@@ -5,7 +5,8 @@ edition = "2021"
 
 [dependencies]
 anyhow = "1.0.86"
-iron = "0.6.1"
+chrono = "0.4.38"
+lazy_static = "1.5.0"
 serde_json = "1.0.125"
 tokio = { version = "1", features = ["full"] }
 wasmtime = "23.0.2"

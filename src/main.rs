@@ -1,16 +1,23 @@
-extern crate iron;
+mod nodehttp;
+
+// use nodehttp::Request;
+// use nodehttp::Response;
+
 use anyhow::anyhow;
+use nodehttp::Response;
+use std::collections::HashMap;
 
-use iron::prelude::*;
-use iron::status;
-
-use serde_json::Value;
 use serde_json::json;
+use serde_json::Value;
 use std::env;
 use std::fs;
 use std::process;
 use std::sync::{Arc, Mutex};
 use wasmtime::*;
+
+static mut WASM_STORE: Option<Store<()>> = None;
+static mut WASM_INSTANCE: Option<Instance> = None;
+static mut RESPONSE_STACK: Vec<Response> = Vec::new();
 
 // Define the function to initialize WASM and return an instance and store
 fn init_wasm(wasm_path: &str) -> (Store<()>, Instance) {
@@ -45,7 +52,7 @@ fn init_wasm(wasm_path: &str) -> (Store<()>, Instance) {
                     let clean_string = utf8_string.replace("\0", "");
                     if let Ok(json_value) = serde_json::from_str::<Value>(&clean_string) {
                         tokio::spawn(async move {
-                            let _ = handle_receive(json_value);
+                            handle_receive(json_value).await.unwrap();
                         });
                     } else {
                         eprintln!("Failed to parse JSON.");
@@ -120,18 +127,29 @@ fn h_re<T>(store: &mut Store<T>, instance: &Instance) -> Result<()> {
     Ok(())
 }
 
-fn send_event<T>(store: &mut Store<T>, instance: &Instance, event_type: &str, data: Value) {
-    let json = json!([event_type, data]).to_string();
-    let utf16: Vec<u16> = json.encode_utf16().collect();
-    let mut uint8array = Vec::with_capacity(utf16.len() * 2);
-    for &word in utf16.iter() {
-        uint8array.push((word >> 8) as u8);
-        uint8array.push(word as u8);
+fn send_event(event_type: &str, data: Value) {
+    let store = unsafe { WASM_STORE.as_mut() };
+    let instance = unsafe { WASM_INSTANCE.as_ref() };
+    match (store, instance) {
+        (Some(store), Some(instance)) => {
+            let json = json!([event_type, data]).to_string();
+            let utf16: Vec<u16> = json.encode_utf16().collect();
+            let mut uint8array = Vec::with_capacity(utf16.len() * 2);
+            for &word in utf16.iter() {
+                uint8array.push((word >> 8) as u8);
+                uint8array.push(word as u8);
+            }
+            for &byte in uint8array.iter() {
+                let _ = h_rd(store, instance, byte as i32);
+            }
+            let _ = h_re(store, instance);
+        }
+
+        _ => {
+            eprintln!("WASM not initialized");
+            return;
+        }
     }
-    for &byte in uint8array.iter() {
-        let _ = h_rd(store, instance, byte as i32);
-    }
-    let _ = h_re(store, instance);
 }
 
 #[tokio::main]
@@ -139,11 +157,14 @@ async fn main() {
     let wasm_path = env::args().nth(1).expect("Usage: <wasm-file>");
 
     // Initialize WASM and get store and instance
-    let (mut store, instance) = init_wasm(&wasm_path);
-
-
-
+    let (store, instance) = init_wasm(&wasm_path);
+    unsafe {
+        WASM_STORE = Some(store);
+        WASM_INSTANCE = Some(instance);
+    }
     // Optionally call '_start' if it exists
+    let instance = unsafe { WASM_INSTANCE.as_ref().unwrap() };
+    let mut store: Store<()> = unsafe { WASM_STORE.take().unwrap() };
     if let Ok(start) = instance.get_typed_func::<(), ()>(&mut store, "_start") {
         if let Err(err) = start.call(&mut store, ()) {
             eprintln!("Failed to execute '_start': {}", err);
@@ -153,47 +174,145 @@ async fn main() {
         println!("No '_start' function found in {}", wasm_path);
     }
 
-    // send_event(&mut store, &instance, "echo", json!("Hello, World!"));
+    unsafe {
+        WASM_STORE = Some(store);
+        WASM_INSTANCE = Some(*instance);
+    }
 
     // keep the main thread alive till ctrl c is pressed
     tokio::signal::ctrl_c().await.unwrap();
-    process::exit(0); 
+    process::exit(0);
 }
 
 // Function to handle the parsed JSON object
-fn handle_receive(json_value: Value) -> std::io::Result<()> {
+async fn handle_receive(json_value: Value) -> std::io::Result<()> {
     println!("Received JSON: {}", json_value);
 
-    fn listen(port: u16) -> std::io::Result<()> {
-        fn handler(req: &mut Request) -> IronResult<Response> {
-            println!("Received request: {}", req.url);
-            Ok(Response::with((status::Ok, "Hello, World!")))
-        }
+    async fn listen(port: u16) -> std::io::Result<()> {
+        // 创建一个 HTTP 服务器
+        let server = nodehttp::create_server(|req, res| {
+            if [
+                "GET", "POST", "PUT", "DELETE", "HEAD", "OPTIONS", "CONNECT", "TRACE", "PATCH",
+            ]
+            .contains(&(req.method.as_str()))
+            {
+                Box::pin(async move {
+                    let data = json!([
+                        {
+                            "method": req.method,
+                            "url": req.path,
+                        },
+                        {
+                            "id": unsafe{RESPONSE_STACK.len()},
+                        }
+                    ]);
+                    println!("{}", data);
+                    // 设置响应头
+                    send_event("http.request", data);
+                    unsafe {
+                        RESPONSE_STACK.push(res);
+                    }
 
-        // Create the Iron server and assign the handler.
-        Iron::new(handler)
-            .http("0.0.0.0:".to_owned() + &port.to_string())
-            .unwrap();
-        Ok(())
+                    // // Task to receive the value
+                    // res.write_head(200, HashMap::from([("Content-Type", "text/plain")]))
+                    //     .await?;
+
+                    // // 向客户端发送响应内容
+                    // res.end("Hello, World!\n").await?;
+                    Ok(())
+                })
+            } else {
+                Box::pin(async move {
+                    eprintln!("Invalid method `{}`", req.method);
+                    Ok(())
+                })
+            }
+        });
+
+        // 让服务器监听 3000 端口
+        server.listen(port, || {}).await
     }
 
     let handle_type = json_value[0].as_str();
     let handle_data = &json_value[1];
     match handle_type {
         Some(t) => match t {
-            "http.createServer" => Ok(()),
             "http.listen" => {
                 let port = handle_data.as_f64();
                 match port {
-                    Some(port) => listen(port as u16),
+                    Some(port) => listen(port as u16).await,
                     _ => {
                         eprintln!("Invalid port value");
                         Ok(())
                     }
                 }
             }
+            "http.writeHead" => {
+                if let Value::Array(vec) = handle_data {
+                    match vec.as_slice() {
+                        [Value::Number(id), Value::Number(status_code), Value::Object(headers)] => {
+                            let response = unsafe {
+                                RESPONSE_STACK.get_mut(id.as_i64().unwrap_or(0i64) as usize)
+                            };
+                            let status_code = status_code.as_i64().unwrap_or(500i64) as u16;
+                            let headers = headers;
+                            match response {
+                                Some(response) => {
+                                    response
+                                        .write_head(
+                                            status_code,
+                                            HashMap::from([("Content-Type", "text/plain")]),
+                                        )
+                                        .await?;
+                                }
+                                None => {
+                                    eprintln!("Invalid response id");
+                                    return Ok(());
+                                }
+                            }
+
+                            Ok(())
+                        }
+                        _ => {
+                            eprintln!("Invalid http.writeHead data");
+                            Ok(())
+                        }
+                    }
+                } else {
+                    println!("Expected an array.");
+                    Ok(())
+                }
+            }
+            "http.end" => {
+                if let Value::Array(vec) = handle_data {
+                    match vec.as_slice() {
+                        [Value::Number(id), Value::String(body)] => {
+                            let response = unsafe {
+                                RESPONSE_STACK.get_mut(id.as_i64().unwrap_or(0i64) as usize)
+                            };
+                            match response {
+                                Some(response) => {
+                                    response.end(body).await?;
+                                    Ok(())
+                                }
+                                None => {
+                                    eprintln!("Invalid response id");
+                                    Ok(())
+                                }
+                            }
+                        }
+                        _ => {
+                            eprintln!("Invalid http.end data");
+                            Ok(())
+                        }
+                    }
+                } else {
+                    println!("Expected an array.");
+                    Ok(())
+                }
+            }
             _ => {
-                println!("Unknown handle type");
+                println!("Unknown method `{}`", t);
                 Ok(())
             }
         },
