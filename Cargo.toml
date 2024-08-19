@@ -7,7 +7,6 @@ edition = "2021"
 anyhow = "1.0.86"
 chrono = "0.4.38"
 clap = "4.5.16"
-lazy_static = "1.5.0"
 serde_json = "1.0.125"
 tokio = { version = "1", features = ["full"] }
 wasmtime = "23.0.2"

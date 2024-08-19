@@ -12,6 +12,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::process;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::LazyLock;
 use std::sync::{Arc, Mutex};
 use wasmtime::*;
 
@@ -30,14 +31,9 @@ fn log(level: usize, message: &str) {
 static mut WASM_STORE: Option<Store<()>> = None;
 static mut WASM_INSTANCE: Option<Instance> = None;
 
-#[macro_use]
-extern crate lazy_static;
-
-lazy_static! {
-    static ref RESPONSE_MAP: Arc<Mutex<HashMap<usize, Response>>> =
-        Arc::new(Mutex::new(HashMap::new()));
-    static ref NEXT_ID: AtomicUsize = AtomicUsize::new(0);
-}
+static RESPONSE_MAP: LazyLock<Mutex<HashMap<usize, Response>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+static NEXT_ID: AtomicUsize = AtomicUsize::new(0);
 
 // Define the function to initialize WASM and return an instance and store
 fn init_wasm(wasm_path: &str) -> (Store<()>, Instance) {
@@ -360,8 +356,7 @@ async fn handle_receive(json_value: Value) -> std::io::Result<()> {
                             let index = id.as_f64().unwrap_or(0f64) as usize;
                             let headers = headers;
                             log(3, format!("index: {}", index).as_str());
-                            let mut response_map = RESPONSE_MAP.lock().unwrap();
-                            let response = response_map.remove(&index);
+                            let response = RESPONSE_MAP.lock().unwrap().remove(&index);
                             match response {
                                 Some(mut response) => {
                                     response
