@@ -13,6 +13,7 @@ use std::fs;
 use std::process;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use tokio::task;
 use wasmtime::*;
 
 static LOG_LEVEL: AtomicUsize = AtomicUsize::new(0);
@@ -72,7 +73,7 @@ fn init_wasm(wasm_path: &str) -> (Store<()>, Instance) {
                     let clean_string = utf8_string.replace("\0", "");
                     if let Ok(json_value) = serde_json::from_str::<Value>(&clean_string) {
                         tokio::spawn(async move {
-                            handle_receive(json_value).await.unwrap();
+                            handle_receive(json_value);
                         });
                     } else {
                         eprintln!("Failed to parse JSON.");
@@ -265,37 +266,33 @@ async fn handle_receive(json_value: Value) -> std::io::Result<()> {
             ]
             .contains(&(req.method.as_str()))
             {
-                Box::pin(async move {
-                    let id = NEXT_ID.fetch_add(1, Ordering::SeqCst);
-                    let data = json!([
-                        {
-                            "method": req.method,
-                            "url": req.path,
-                        },
-                        {
-                            "id": id,
-                        }
-                    ]);
-                    log(1, &format!("{}", data));
-                    send_event("http.request", data);
+                let id = NEXT_ID.fetch_add(1, Ordering::SeqCst);
+                let data = json!([
+                    {
+                        "method": req.method,
+                        "url": req.path,
+                    },
+                    {
+                        "id": id,
+                    }
+                ]);
+                log(1, &format!("{}", data));
+                send_event("http.request", data);
 
-                    // 存储 ID 和响应的映射
-                    let mut response_map = RESPONSE_MAP.lock().unwrap();
-                    response_map.insert(id, res);
+                // 存储 ID 和响应的映射
+                let mut response_map = RESPONSE_MAP.lock().unwrap();
+                response_map.insert(id, res);
 
-                    Ok(())
-                })
+                Ok(())
             } else {
-                Box::pin(async move {
-                    log(2, &format!("Invalid method `{}`", req.method));
-                    // res.write_head(
-                    //     200,
-                    //     std::collections::HashMap::from([("Content-Type", "text/plain")]),
-                    // )
-                    // .await?;
-                    res.end("").await?;
-                    Ok(())
-                })
+                log(2, &format!("Invalid method `{}`", req.method));
+                // res.write_head(
+                //     200,
+                //     std::collections::HashMap::from([("Content-Type", "text/plain")]),
+                // )
+                // .await?;
+                res.end("");
+                Ok(())
             }
         });
 

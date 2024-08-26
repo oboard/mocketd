@@ -10,8 +10,7 @@ use tokio::net::{TcpListener, TcpStream};
 
 // Define a type alias for the request handler function
 // FIXME: AsyncMut
-type RequestHandler =
-    fn(Request, Response) -> Pin<Box<dyn Future<Output = Result<(), Box<dyn Error>>> + Send>>;
+type RequestHandler = fn(Request, Response) -> io::Result<()>;
 
 pub struct Request {
     pub method: String,
@@ -111,7 +110,7 @@ async fn handle_connection(stream: TcpStream, handler: RequestHandler) -> io::Re
     println!("{}", request_line.to_string());
 
     let request = Request { method, path };
-    if let Err(e) = handler(request, stream).await {
+    if let Err(e) = handler(request, stream) {
         todo!("{e}")
     }
 
