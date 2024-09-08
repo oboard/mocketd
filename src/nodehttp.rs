@@ -10,7 +10,8 @@ use tokio::net::{TcpListener, TcpStream};
 
 // Define a type alias for the request handler function
 // FIXME: AsyncMut
-type RequestHandler = fn(Request, Response) -> io::Result<()>;
+type RequestHandler =
+    fn(&Request, Response) -> Pin<Box<dyn Future<Output = Result<(), Box<dyn Error>>> + Send>>;
 
 pub struct Request {
     pub method: String,
@@ -32,7 +33,6 @@ impl Response {
         let mut response_header = format!(
             "HTTP/1.1 {status_code} OK\r\n\
             Date: {date}\r\n\
-            Connection: keep-alive\r\n\
             Keep-Alive: timeout=5\r\n\
             Transfer-Encoding: chunked\r\n"
         );
@@ -53,7 +53,7 @@ impl Response {
         self.stream.write_all(response_header.as_bytes()).await
     }
 
-    pub async fn end(&mut self, body: &str) -> io::Result<()> {
+    pub async fn end(&mut self, body: &str) {
         let body_len = body.len();
         let mut chunked_body = String::new();
 
@@ -68,8 +68,8 @@ impl Response {
         )
         .unwrap();
 
-        self.stream.write_all(chunked_body.as_bytes()).await?;
-        self.stream.flush().await
+        self.stream.write_all(chunked_body.as_bytes()).await.unwrap();
+        self.stream.flush().await.unwrap();
     }
 }
 
@@ -88,8 +88,9 @@ impl Server {
 
         loop {
             let (stream, _) = listener.accept().await?;
+            let handler = self.handler;
             tokio::spawn(async move {
-                if let Err(e) = handle_connection(stream, self.handler).await {
+                if let Err(e) = handle_connection(stream, handler).await {
                     todo!("{e}")
                 }
             });
@@ -110,7 +111,7 @@ async fn handle_connection(stream: TcpStream, handler: RequestHandler) -> io::Re
     println!("{}", request_line.to_string());
 
     let request = Request { method, path };
-    if let Err(e) = handler(request, stream) {
+    if let Err(e) = handler(&request, stream).await {
         todo!("{e}")
     }
 

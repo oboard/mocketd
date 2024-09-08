@@ -13,7 +13,6 @@ use std::fs;
 use std::process;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use tokio::task;
 use wasmtime::*;
 
 static LOG_LEVEL: AtomicUsize = AtomicUsize::new(0);
@@ -71,10 +70,12 @@ fn init_wasm(wasm_path: &str) -> (Store<()>, Instance) {
             if !data.is_empty() {
                 if let Ok(utf8_string) = String::from_utf16(&data) {
                     let clean_string = utf8_string.replace("\0", "");
+                    log(1, &format!("Received JSON RAW: {}", clean_string));
                     if let Ok(json_value) = serde_json::from_str::<Value>(&clean_string) {
-                        tokio::spawn(async move {
-                            handle_receive(json_value);
-                        });
+                        log(1, &format!("Received JSON Parse: {}", json_value));
+                        // tokio::spawn(async move {
+                        handle_receive(json_value);
+                        // });
                     } else {
                         eprintln!("Failed to parse JSON.");
                         println!("{}", clean_string);
@@ -252,52 +253,61 @@ fn map_to_iter(
 }
 
 // Function to handle the parsed JSON object
-async fn handle_receive(json_value: Value) -> std::io::Result<()> {
+fn handle_receive(json_value: Value) -> std::io::Result<()> {
     log(1, &format!("Received JSON: {}", json_value));
 
-    async fn listen(port: u16) -> std::io::Result<()> {
+    fn listen(port: u16) {
         log(1, &format!("Listening on port {}", port));
 
         let server = nodehttp::create_server(|req, mut res| {
             log(2, &format!("Received request: {} {}", req.method, req.path));
+            // Box::pin(async move {
+            //     // 设置响应头
+            //     res.write_head(200, HashMap::from([("Content-Type", "text/plain")]))
+            //         .await?;
 
-            if [
-                "GET", "POST", "PUT", "DELETE", "HEAD", "OPTIONS", "CONNECT", "TRACE", "PATCH",
-            ]
-            .contains(&(req.method.as_str()))
-            {
-                let id = NEXT_ID.fetch_add(1, Ordering::SeqCst);
-                let data = json!([
-                    {
-                        "method": req.method,
-                        "url": req.path,
-                    },
-                    {
-                        "id": id,
-                    }
-                ]);
-                log(1, &format!("{}", data));
-                send_event("http.request", data);
+            //     // 向客户端发送响应内容
+            //     res.end("Hello, World!\n").await?;
+            //     Ok(())
+            // })
+            Box::pin(async move {
+                // if [
+                //     "GET", "POST", "PUT", "DELETE", "HEAD", "OPTIONS", "CONNECT", "TRACE", "PATCH",
+                // ]
+                // .contains(&(req.method.as_str()))
+                // {
+                //     let id = NEXT_ID.fetch_add(1, Ordering::SeqCst);
+                //     let data = json!([
+                //         {
+                //             "method": req.method,
+                //             "url": req.path,
+                //         },
+                //         {
+                //             "id": id,
+                //         }
+                //     ]);
+                //     // log(1, &format!("{}", data));
+                //     send_event("http.request", data);
 
-                // 存储 ID 和响应的映射
-                let mut response_map = RESPONSE_MAP.lock().unwrap();
-                response_map.insert(id, res);
+                //     // 存储 ID 和响应的映射
+                //     let mut response_map = RESPONSE_MAP.lock().unwrap();
+                //     response_map.insert(id, res);
+                //     Ok(())
+                // } else {
+                // log(2, &format!("Invalid method `{}`", req.method));
+                // 设置响应头
+                res.write_head(200, HashMap::from([("Content-Type", "text/plain")]))
+                    .await?;
 
+                // 向客户端发送响应内容
+                res.end("Hello, World!\n").await;
                 Ok(())
-            } else {
-                log(2, &format!("Invalid method `{}`", req.method));
-                // res.write_head(
-                //     200,
-                //     std::collections::HashMap::from([("Content-Type", "text/plain")]),
-                // )
-                // .await?;
-                res.end("");
-                Ok(())
-            }
+                // }
+            })
         });
 
         // 让服务器监听 3000 端口
-        server.listen(port, || {}).await
+        tokio::spawn(async move { server.listen(port, || {}).await });
     }
 
     let handle_type = json_value[0].as_str();
@@ -307,7 +317,10 @@ async fn handle_receive(json_value: Value) -> std::io::Result<()> {
             "http.listen" => {
                 let port = handle_data.as_f64();
                 match port {
-                    Some(port) => listen(port as u16).await,
+                    Some(port) => {
+                        listen(port as u16);
+                        Ok(())
+                    }
                     _ => {
                         eprintln!("Invalid port value");
                         Ok(())
@@ -361,21 +374,19 @@ async fn handle_receive(json_value: Value) -> std::io::Result<()> {
                             let response = response_map.remove(&index);
                             match response {
                                 Some(mut response) => {
-                                    response
-                                        .write_head(
-                                            status_code.as_f64().unwrap_or(500f64) as u16,
-                                            map_to_iter(headers.clone()),
-                                        )
-                                        .await?;
+                                    let _ = response.write_head(
+                                        status_code.as_f64().unwrap_or(500f64) as u16,
+                                        map_to_iter(headers.clone()),
+                                    );
 
                                     // 如果是string则直接发送，如果是json object则strinify
                                     match body {
                                         Value::String(s) => {
-                                            response.end(s).await?;
+                                            let _ = response.end(s);
                                         }
                                         Value::Object(o) => {
                                             let json_string = serde_json::to_string(o).unwrap();
-                                            response.end(&json_string).await?;
+                                            let _ = response.end(&json_string);
                                         }
                                         _ => {
                                             eprintln!("Invalid body type");
